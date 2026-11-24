@@ -1,0 +1,363 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Huawei Cell Lock</title>
+
+<style>
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #f4f6fa;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: #172033;
+  padding: 20px;
+}
+
+.card {
+  width: 100%;
+  max-width: 390px;
+  padding: 32px;
+  background: white;
+  border: 1px solid #e8ebf1;
+  border-radius: 18px;
+  box-shadow: 0 12px 40px #1720330d;
+}
+
+h2 { margin: 0 0 8px; font-size: 23px; }
+
+p {
+  color: #758096;
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+label {
+  display: block;
+  font-size: 13px;
+  font-weight: 600;
+  margin: 22px 0 8px;
+}
+
+input {
+  width: 100%;
+  padding: 13px;
+  border: 1px solid #dce1ea;
+  border-radius: 9px;
+  font-size: 16px;
+  outline: none;
+}
+
+input:focus { border-color: #4169e1; }
+
+button {
+  width: 100%;
+  padding: 14px;
+  margin-top: 18px;
+  background: #315eea;
+  color: white;
+  border: 0;
+  border-radius: 9px;
+  font-size: 15px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+button:disabled { opacity: .6; cursor: wait; }
+
+#status {
+  margin-top: 18px;
+  padding: 12px;
+  background: #f5f7fb;
+  border-radius: 9px;
+  font-size: 13px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.small {
+  font-size: 12px;
+  color: #929bad;
+  margin-top: 20px;
+}
+</style>
+</head>
+
+<body>
+<main class="card">
+  <h2>Huawei Cell Lock</h2>
+  <p>Connect to your B715 router and inspect the target LTE cell.</p>
+
+  <form id="lockForm">
+    <label for="username">Router username</label>
+    <input id="username" value="admin" autocomplete="username" required>
+
+    <label for="password">Router password</label>
+    <input id="password" type="password"
+      autocomplete="current-password" required>
+
+    <label for="cellId">Target CELL_ID</label>
+    <input id="cellId" value="28057964"
+      inputmode="numeric" pattern="[0-9]+" required>
+
+    <button id="submit" type="submit">Login & Inspect Cell</button>
+  </form>
+
+  <div id="status" role="status">
+    Ready. Enter your router credentials.
+  </div>
+
+  <div class="small">
+    Huawei B715s-23c · Client-side prototype
+  </div>
+</main>
+
+<script>
+const ROUTER = "http://192.168.8.1";
+
+const form = document.getElementById("lockForm");
+const statusBox = document.getElementById("status");
+const submit = document.getElementById("submit");
+
+function status(message) {
+  statusBox.textContent = message;
+}
+
+// XML escaping for user-provided values.
+function xmlEscape(value) {
+  return value.replace(/[<>&'"]/g, char => ({
+    "<": "&lt;",
+    ">": "&gt;",
+    "&": "&amp;",
+    "'": "&apos;",
+    '"': "&quot;"
+  })[char]);
+}
+
+// SHA256 hexadecimal digest.
+async function sha256(value) {
+  const bytes = new TextEncoder().encode(value);
+  const hash = await crypto.subtle.digest("SHA-256", bytes);
+
+  return Array.from(new Uint8Array(hash))
+    .map(b => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+// Base64 encode UTF-8 strings.
+function base64(value) {
+  const bytes = new TextEncoder().encode(value);
+  let binary = "";
+
+  bytes.forEach(byte => binary += String.fromCharCode(byte));
+
+  return btoa(binary);
+}
+
+// Huawei password_type = 4.
+async function encodePassword(username, password, token) {
+  const passwordHash = await sha256(password);
+
+  const passwordBase64 = base64(passwordHash);
+
+  const finalHash = await sha256(
+    username + passwordBase64 + token
+  );
+
+  return base64(finalHash);
+}
+
+// Parse Huawei XML.
+function parseXML(xml) {
+  const doc = new DOMParser().parseFromString(
+    xml,
+    "application/xml"
+  );
+
+  if (doc.querySelector("parsererror")) {
+    throw new Error("Invalid XML response from router.");
+  }
+
+  const error = doc.querySelector("error");
+
+  if (error) {
+    const code = error.querySelector("code")?.textContent;
+    throw new Error("Huawei API error: " + code);
+  }
+
+  return doc;
+}
+
+// HTTP request.
+async function request(path, options = {}) {
+  let response;
+
+  try {
+    response = await fetch(ROUTER + path, {
+      ...options,
+      credentials: "include",
+      cache: "no-store"
+    });
+  } catch (error) {
+    throw new Error(
+      "Browser blocked the router request.\n" +
+      "Check CORS permissions and router origin.\n" +
+      "Details: " + error.message
+    );
+  }
+
+  const body = await response.text();
+
+  if (!response.ok) {
+    throw new Error("HTTP " + response.status + ": " + body);
+  }
+
+  return {
+    body,
+    headers: response.headers
+  };
+}
+
+// Obtain session and CSRF token.
+async function initializeSession() {
+  status("1/4 Initializing Huawei session...");
+
+  const result = await request(
+    "/api/webserver/SesTokInfo"
+  );
+
+  const xml = parseXML(result.body);
+
+  const token = xml.querySelector("TokInfo")?.textContent;
+  const session = xml.querySelector("SesInfo")?.textContent;
+
+  if (!token || !session) {
+    throw new Error("Could not obtain Huawei session information.");
+  }
+
+  return { token, session };
+}
+
+// Check login state.
+async function getLoginState(token) {
+  const result = await request(
+    "/api/user/state-login",
+    {
+      headers: {
+        "__RequestVerificationToken": token,
+        "X-Requested-With": "XMLHttpRequest"
+      }
+    }
+  );
+
+  return parseXML(result.body);
+}
+
+// Huawei login.
+async function login(username, password, token) {
+  status("2/4 Calculating Huawei password hash...");
+
+  const encodedPassword = await encodePassword(
+    username,
+    password,
+    token
+  );
+
+  const payload = `
+    <request>
+      <Username>${xmlEscape(username)}</Username>
+      <Password>${encodedPassword}</Password>
+      <password_type>4</password_type>
+    </request>
+  `;
+
+  status("3/4 Authenticating with Huawei router...");
+
+  const result = await request(
+    "/api/user/login",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/xml; charset=UTF-8",
+        "__RequestVerificationToken": token,
+        "X-Requested-With": "XMLHttpRequest"
+      },
+      body: payload
+    }
+  );
+
+  parseXML(result.body);
+
+  return result;
+}
+
+// Main application.
+form.addEventListener("submit", async event => {
+  event.preventDefault();
+
+  const username = document.getElementById("username").value.trim();
+  const passwordInput = document.getElementById("password");
+  const password = passwordInput.value;
+  const cellId = document.getElementById("cellId").value.trim();
+
+  if (!/^\d+$/.test(cellId)) {
+    status("Invalid CELL_ID.");
+    return;
+  }
+
+  submit.disabled = true;
+
+  try {
+    // Initialize session.
+    const session = await initializeSession();
+
+    // Check login state.
+    const loginState = await getLoginState(session.token);
+
+    const state = loginState.querySelector("State")?.textContent;
+
+    if (state !== "0") {
+      // Authenticate.
+      await login(username, password, session.token);
+    }
+
+    passwordInput.value = "";
+
+    status("4/4 Verifying authentication...");
+
+    const verification = await getLoginState(session.token);
+
+    const finalState = verification.querySelector("State")?.textContent;
+
+    if (finalState !== "0") {
+      throw new Error(
+        "Login was not confirmed. Router state: " + finalState
+      );
+    }
+
+    status(
+      "LOGIN SUCCESSFUL!\n\n" +
+      "Router: Huawei B715s-23c\n" +
+      "Target CELL_ID: " + cellId +
+      "\n\nAuthentication succeeded.\n" +
+      "Cell locking is not implemented yet.\n" +
+      "Next: retrieve EARFCN and PCI and verify the firmware's cell-lock API."
+    );
+
+  } catch (error) {
+    status("FAILED:\n\n" + error.message);
+  } finally {
+    submit.disabled = false;
+  }
+});
+</script>
+</body>
+</html>
